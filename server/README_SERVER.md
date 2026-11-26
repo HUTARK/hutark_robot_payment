@@ -50,6 +50,16 @@ Config comes only from environment variables: `RAZORPAY_KEY_ID`,
 `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`, `HUTARK_AI_PRIVATE_KEY`,
 `AI_PLAN_DB`.
 
+**First month free:** `FREE_FIRST_MONTH` in `recharge_api.py` (₹300 / 30
+days; `None` switches it off). When a robot on the factory list calls
+`/ai-plan/pending` for the first time and has never had a recharge, the
+server issues it a free code (`recharge_id` `free_<robot_id>`, source
+`free`) – once per robot, ever.
+
+**Old codes are refreshed:** robots refuse codes signed more than 7 days
+ago. `/ai-plan/pending` re-signs unapplied codes older than 6 days
+(same recharge_id, credit and days, so still usable once).
+
 Optional `AI_PLAN_ROBOTS`: path of the factory robot list. Orders are then
 accepted only for robots on it, so a typo on the payment page cannot pay for
 a robot that doesn't exist. One robot per line, optionally followed by the
@@ -69,7 +79,7 @@ pip install -r requirements.txt pytest
 python -m pytest tests
 ```
 
-Codes must be applied within 7 days of being issued.
+Codes must be applied within 7 days of being signed (`/pending` re-signs old unapplied ones; hand-made codes from `ai_recharge.py sign` are not refreshed).
 
 ## Manual code (offline payment / testing)
 

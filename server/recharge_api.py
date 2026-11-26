@@ -11,6 +11,7 @@ Endpoints (full reference in SERVER_SETUP.md)
   POST /ai-plan/webhook  Razorpay webhook (payment.captured) - issues the code even
                          if the app never calls /confirm
   GET  /ai-plan/pending?robot_id=X   codes issued for X, not yet applied
+                                     (first call of a listed robot: free first month)
                                      (the robot polls this itself)
   POST /ai-plan/applied  {recharge_id}                 -> mark a code as applied
   GET  /ai-plan/robot?robot_id=X     is X a Hutark robot (+ model), for the pay page
@@ -65,6 +66,17 @@ PLANS = {
     "monthly": {"price_inr": 499, "credit_inr": 300, "days": 30},
 }
 
+# First month free: the first time a robot on the factory list asks
+# /ai-plan/pending and has never had a recharge, it gets this plan for free
+# (recharge_id "free_<robot_id>", so at most once per robot, ever).
+# None switches it off. Needs the factory list (AI_PLAN_ROBOTS).
+FREE_FIRST_MONTH = {"credit_inr": 300, "days": 30}
+
+# Robots refuse codes older than 7 days. An unapplied code older than this
+# (robot switched off for a week) is re-signed - same recharge_id, credit and
+# days, so it still works only once - before /pending hands it out again.
+REFRESH_CODES_AFTER_S = 6 * 86400
+
 REQUIRED_ENV = ("RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET",
                 "RAZORPAY_WEBHOOK_SECRET", "HUTARK_AI_PRIVATE_KEY", "AI_PLAN_DB")
 
@@ -81,6 +93,7 @@ RATE_LIMITS = {
 
 ROBOT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 RZP_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")     # order_XXXX / pay_XXXX
+RECHARGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")   # pay_XXXX / free_<robot_id>
 
 log = logging.getLogger("hutark-ai")
 
@@ -107,7 +120,8 @@ CREATE TABLE IF NOT EXISTS recharges(
 MIGRATIONS = {
     "orders": [("credit_inr", "REAL"), ("days", "INTEGER")],
     "recharges": [("applied", "INTEGER NOT NULL DEFAULT 0"),
-                  ("applied_at", "REAL"), ("source", "TEXT")],
+                  ("applied_at", "REAL"), ("source", "TEXT"),
+                  ("code_issued", "REAL")],      # when `code` was signed
 }
 RECHARGE_COLS = "payment_id, order_id, robot_id, credit_inr, days, code, created"
 
@@ -137,6 +151,10 @@ class RobotRegistry:
                     robots[parts[0].upper()] = (parts[0], model)
         self._robots, self._mtime = robots, mtime
         log.info("robot list loaded: %d robots", len(robots))
+
+    @property
+    def enabled(self):
+        return bool(self.path)
 
     def lookup(self, robot_id):
         """-> (robot_id as in the list, model), or (None, None) if unknown.
@@ -246,7 +264,12 @@ def create_app(env=None):
                 have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
                 for name, decl in cols:
                     if name not in have:
-                        con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                        try:
+                            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                        except sqlite3.OperationalError as e:
+                            # the other gunicorn worker added it a moment ago
+                            if "duplicate column" not in str(e):
+                                raise
             con.execute("CREATE INDEX IF NOT EXISTS recharges_robot_pending "
                         "ON recharges(robot_id, applied)")
             con.commit()
@@ -307,10 +330,10 @@ def create_app(env=None):
         try:
             with db() as con:
                 con.execute("INSERT INTO recharges(payment_id, order_id, robot_id, "
-                            "credit_inr, days, code, created, applied, source) "
-                            "VALUES (?,?,?,?,?,?,?,0,?)",
+                            "credit_inr, days, code, created, applied, source, "
+                            "code_issued) VALUES (?,?,?,?,?,?,?,0,?,?)",
                             (payment_id, order_id, order["robot_id"], credit, days,
-                             code, now, source))
+                             code, now, source, now))
         except sqlite3.IntegrityError:
             # /confirm and the webhook arrived together and the other one won.
             with db() as con:
@@ -480,13 +503,59 @@ def create_app(env=None):
         robot_id = _str(request.args.get("robot_id"))
         if not ROBOT_ID_RE.match(robot_id):
             return jsonify(error="robot_id is required"), 400
+        grant_free_first_month(robot_id)
         with db() as con:
-            rows = con.execute("SELECT payment_id, code, credit_inr, days, created "
+            rows = con.execute("SELECT payment_id, robot_id, code, credit_inr, days, "
+                               "created, COALESCE(code_issued, created) AS issued "
                                "FROM recharges WHERE robot_id=? AND applied=0 "
                                "ORDER BY created", (robot_id,)).fetchall()
-        return jsonify([{"recharge_id": r["payment_id"], "code": r["code"],
-                         "credit_inr": r["credit_inr"], "days": r["days"],
-                         "created": r["created"]} for r in rows])
+        out = []
+        for r in rows:
+            code = r["code"]
+            if time.time() - r["issued"] > REFRESH_CODES_AFTER_S:
+                code = refresh_code(r)
+            out.append({"recharge_id": r["payment_id"], "code": code,
+                        "credit_inr": r["credit_inr"], "days": r["days"],
+                        "created": r["created"]})
+        return jsonify(out)
+
+    def grant_free_first_month(robot_id):
+        """Free first month for a listed robot that never had a recharge.
+        Only for the exact id on the factory list (the one the robot itself
+        sends), and only once ever per robot (fixed recharge_id)."""
+        if not FREE_FIRST_MONTH or not registry.enabled:
+            return
+        if registry.lookup(robot_id)[0] != robot_id:
+            return
+        with db() as con:
+            if con.execute("SELECT 1 FROM recharges WHERE robot_id=? LIMIT 1",
+                           (robot_id,)).fetchone():
+                return
+        recharge_id = f"free_{robot_id}"
+        credit, days = FREE_FIRST_MONTH["credit_inr"], FREE_FIRST_MONTH["days"]
+        code = ai_recharge.make_code(robot_id, credit, days, recharge_id=recharge_id)
+        now = time.time()
+        with db() as con:
+            cur = con.execute("INSERT OR IGNORE INTO recharges(payment_id, order_id, "
+                              "robot_id, credit_inr, days, code, created, applied, "
+                              "source, code_issued) VALUES (?,NULL,?,?,?,?,?,0,'free',?)",
+                              (recharge_id, robot_id, credit, days, code, now, now))
+        if cur.rowcount:
+            log.info("free first month issued: robot=%s credit=%s days=%s",
+                     robot_id, credit, days)
+
+    def refresh_code(row):
+        """Re-sign an unapplied code that is getting too old for the robot.
+        Same recharge_id/credit/days: still usable only once."""
+        code = ai_recharge.make_code(row["robot_id"], row["credit_inr"], row["days"],
+                                     recharge_id=row["payment_id"])
+        with db() as con:
+            con.execute("UPDATE recharges SET code=?, code_issued=? "
+                        "WHERE payment_id=? AND applied=0",
+                        (code, time.time(), row["payment_id"]))
+        log.info("refreshed old code: recharge=%s robot=%s",
+                 row["payment_id"], row["robot_id"])
+        return code
 
     @app.post("/ai-plan/applied")
     def applied():
@@ -494,7 +563,7 @@ def create_app(env=None):
         if limited:
             return limited
         recharge_id = _str(_json_body().get("recharge_id"))
-        if not RZP_ID_RE.match(recharge_id):
+        if not RECHARGE_ID_RE.match(recharge_id):
             return jsonify(error="recharge_id is required"), 400
         with db() as con:
             cur = con.execute("UPDATE recharges SET applied=1, "
@@ -525,7 +594,7 @@ def create_app(env=None):
         if limited:
             return limited
         recharge_id = _str(request.args.get("recharge_id"))
-        if not RZP_ID_RE.match(recharge_id):
+        if not RECHARGE_ID_RE.match(recharge_id):
             return jsonify(error="recharge_id is required"), 400
         with db() as con:
             row = con.execute("SELECT robot_id, applied, applied_at FROM recharges "

@@ -78,6 +78,13 @@ Important properties:
 - **A code works on one robot only, once.** It cannot be used on another robot.
 - **Two payments both count.** If the robot still has credit when a new code
   arrives, the unused credit is added to the new 30-day plan.
+- **First month free.** A robot that never had a plan gets a free month
+  (₹300 credit, 30 days) automatically the first time it checks in – it
+  shows up in `/pending` as `recharge_id` `free_<robot_id>`. Nothing for the
+  app to do.
+- **Codes don't expire while waiting.** A code the robot hasn't fetched yet
+  is re-signed by the server before it gets too old (robots refuse codes
+  older than 7 days), so a robot switched off for weeks still gets it.
 - **The price is decided by the server**, never by the app.
 
 ---
@@ -183,8 +190,9 @@ For each entry (oldest first): do step 5, then step 6.
 This covers: app killed after payment, phone not near the robot, network
 errors after `/confirm`.
 
-> Codes must be applied **within 7 days** of `created`, otherwise the robot
-> answers `code_too_old` – contact Hutark support (a new code can be issued).
+> A code is valid for 7 days after it was signed. `/pending` always hands out
+> a fresh enough code (the server re-signs old ones), so always take the code
+> from the latest `/pending` answer rather than one stored for days.
 
 ---
 
@@ -258,7 +266,7 @@ Robot `POST /ai_plan/recharge` → `message`:
 |---|---|---|
 | *(200)* | recharged | `POST /ai-plan/applied`, show success |
 | `code_already_used` | this code was applied earlier | `POST /ai-plan/applied`, refresh `GET /ai_plan` |
-| `code_too_old` | code older than 7 days | contact support |
+| `code_too_old` | code older than 7 days | get a fresh one from `/pending`; if it persists, support |
 | `code_is_for_another_robot` | wrong robot | find the right robot (`robot_id`) |
 | `robot_clock_wrong` | robot's clock is off | ask user to connect the robot to the internet, retry |
 | `invalid_code` / `invalid_signature` | damaged or fake code | re-fetch via `/pending`; if it persists, support |
