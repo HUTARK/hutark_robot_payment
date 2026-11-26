@@ -17,6 +17,9 @@ Endpoints (full reference in SERVER_SETUP.md)
   GET  /ai-plan/robot?robot_id=X     is X a Hutark robot (+ model), for the pay page
   GET  /ai-plan/recharge-status?recharge_id=pay_X      applied yet? (pay page)
   GET  /recharge[?robot=X]           customer payment web page (web/recharge.html)
+  POST /ai-plan/checkin  {robot_id, plan, version}     the robot's regular check:
+                                     reports its plan usage, answers like /pending
+  GET  /admin, /admin/api/*          internal dashboard (admin.py; nginx login)
 
 Safety
   * The price comes from the ORDER stored here, never from the app.
@@ -94,6 +97,14 @@ RATE_LIMITS = {
 ROBOT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 RZP_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")     # order_XXXX / pay_XXXX
 RECHARGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")   # pay_XXXX / free_<robot_id>
+VERSION_RE = re.compile(r"^[A-Za-z0-9._+-]{1,40}$")      # robot software, e.g. v1.0.7
+PLAN_REASONS = {"ok", "no_plan", "expired", "credit_used_up"}
+IST_OFFSET_S = 5.5 * 3600
+
+
+def ist_day(ts):
+    """'YYYY-MM-DD' of a unix time in India Standard Time."""
+    return time.strftime("%Y-%m-%d", time.gmtime(ts + IST_OFFSET_S))
 
 log = logging.getLogger("hutark-ai")
 
@@ -115,10 +126,22 @@ CREATE TABLE IF NOT EXISTS recharges(
     payment_id TEXT PRIMARY KEY, order_id TEXT UNIQUE, robot_id TEXT,
     credit_inr REAL, days INTEGER, code TEXT, created REAL,
     applied INTEGER NOT NULL DEFAULT 0, applied_at REAL, source TEXT);
+-- What each robot last reported at check-in (for the admin dashboard).
+CREATE TABLE IF NOT EXISTS robot_status(
+    robot_id TEXT PRIMARY KEY, last_seen REAL NOT NULL, version TEXT,
+    active INTEGER, reason TEXT, credit_inr REAL, used_inr REAL,
+    remaining_inr REAL, days_left REAL, valid_until REAL, answers INTEGER,
+    recharge_id TEXT);
+-- Usage per robot per day (IST) and plan: the last values reported that day.
+CREATE TABLE IF NOT EXISTS usage_daily(
+    robot_id TEXT NOT NULL, day TEXT NOT NULL, recharge_id TEXT NOT NULL,
+    used_inr REAL, answers INTEGER, credit_inr REAL, updated REAL,
+    PRIMARY KEY(robot_id, day, recharge_id));
 """
 # columns added after the first version (older databases get them via ALTER)
 MIGRATIONS = {
-    "orders": [("credit_inr", "REAL"), ("days", "INTEGER")],
+    "orders": [("credit_inr", "REAL"), ("days", "INTEGER"),
+               ("mode", "TEXT")],                # "test" / "live" Razorpay keys
     "recharges": [("applied", "INTEGER NOT NULL DEFAULT 0"),
                   ("applied_at", "REAL"), ("source", "TEXT"),
                   ("code_issued", "REAL")],      # when `code` was signed
@@ -155,6 +178,17 @@ class RobotRegistry:
     @property
     def enabled(self):
         return bool(self.path)
+
+    def all(self):
+        """[(robot_id, model)] in file order; [] with no list."""
+        if not self.path:
+            return []
+        with self._lock:
+            try:
+                self._load()
+            except OSError:
+                pass
+            return list(self._robots.values())
 
     def lookup(self, robot_id):
         """-> (robot_id as in the list, model), or (None, None) if unknown.
@@ -236,6 +270,7 @@ def create_app(env=None):
     limiters = {name: RateLimiter(*lim) for name, lim in RATE_LIMITS.items()}
     registry = RobotRegistry(env.get("AI_PLAN_ROBOTS") or None)
     db_path = cfg["AI_PLAN_DB"]
+    key_mode = "live" if cfg["RAZORPAY_KEY_ID"].startswith("rzp_live_") else "test"
 
     if not log.handlers and not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO,
@@ -270,6 +305,12 @@ def create_app(env=None):
                             # the other gunicorn worker added it a moment ago
                             if "duplicate column" not in str(e):
                                 raise
+                        else:
+                            if (table, name) == ("orders", "mode"):
+                                # Every order before this column existed was
+                                # made with Razorpay TEST keys.
+                                con.execute("UPDATE orders SET mode='test' "
+                                            "WHERE mode IS NULL")
             con.execute("CREATE INDEX IF NOT EXISTS recharges_robot_pending "
                         "ON recharges(robot_id, applied)")
             con.commit()
@@ -433,9 +474,9 @@ def create_app(env=None):
             return jsonify(error="could not create the payment order"), 502
         with db() as con:
             con.execute("INSERT INTO orders(order_id, robot_id, plan_id, amount_paise, "
-                        "created, credit_inr, days) VALUES (?,?,?,?,?,?,?)",
+                        "created, credit_inr, days, mode) VALUES (?,?,?,?,?,?,?,?)",
                         (order_id, robot_id, plan_id, amount, time.time(),
-                         plan["credit_inr"], plan["days"]))
+                         plan["credit_inr"], plan["days"], key_mode))
         log.info("order created: order=%s robot=%s plan=%s amount_paise=%s",
                  order_id, robot_id, plan_id, amount)
         return jsonify(order_id=order_id, amount_paise=amount, currency="INR",
@@ -503,6 +544,78 @@ def create_app(env=None):
         robot_id = _str(request.args.get("robot_id"))
         if not ROBOT_ID_RE.match(robot_id):
             return jsonify(error="robot_id is required"), 400
+        return jsonify(pending_for(robot_id))
+
+    @app.post("/ai-plan/checkin")
+    def checkin():
+        """The robot's regular check: {robot_id, plan: {...ai_credit.status()},
+        version}. Records the plan status for the admin dashboard, then
+        answers exactly like /ai-plan/pending."""
+        limited = rate_limited("lookup")
+        if limited:
+            return limited
+        body = _json_body()
+        robot_id = _str(body.get("robot_id"))
+        if not ROBOT_ID_RE.match(robot_id):
+            return jsonify(error="robot_id is required"), 400
+        try:
+            record_checkin(robot_id, body.get("plan"), body.get("version"))
+        except Exception:                       # never block a recharge on this
+            log.exception("checkin: could not record status for %s", robot_id)
+        return jsonify(pending_for(robot_id))
+
+    def _num(v, lo, hi):
+        """A finite number within [lo, hi], else None (robots are not trusted)."""
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        v = float(v)
+        return v if lo <= v <= hi else None
+
+    def record_checkin(robot_id, plan, version):
+        if registry.enabled and registry.lookup(robot_id)[0] != robot_id:
+            return                               # only robots on the factory list
+        plan = plan if isinstance(plan, dict) else {}
+        version = version if isinstance(version, str) and VERSION_RE.match(version) else None
+        reason = plan.get("reason") if plan.get("reason") in PLAN_REASONS else None
+        rid = plan.get("recharge_id")
+        rid = rid if isinstance(rid, str) and RECHARGE_ID_RE.match(rid) else None
+        vals = {
+            "active": 1 if plan.get("active") is True else 0,
+            "credit_inr": _num(plan.get("credit_inr"), 0, 1e6),
+            "used_inr": _num(plan.get("used_inr"), 0, 1e6),
+            "remaining_inr": _num(plan.get("remaining_inr"), 0, 1e6),
+            "days_left": _num(plan.get("days_left"), 0, 3660),
+            "valid_until": _num(plan.get("valid_until"), 0, 1e11),
+            "answers": _num(plan.get("answers"), 0, 1e9),
+        }
+        if vals["answers"] is not None:
+            vals["answers"] = int(vals["answers"])
+        now = time.time()
+        with db() as con:
+            con.execute(
+                "INSERT INTO robot_status(robot_id, last_seen, version, active, reason, "
+                "credit_inr, used_inr, remaining_inr, days_left, valid_until, answers, "
+                "recharge_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(robot_id) DO UPDATE SET last_seen=excluded.last_seen, "
+                "version=COALESCE(excluded.version, version), active=excluded.active, "
+                "reason=excluded.reason, credit_inr=excluded.credit_inr, "
+                "used_inr=excluded.used_inr, remaining_inr=excluded.remaining_inr, "
+                "days_left=excluded.days_left, valid_until=excluded.valid_until, "
+                "answers=excluded.answers, recharge_id=excluded.recharge_id",
+                (robot_id, now, version, vals["active"], reason, vals["credit_inr"],
+                 vals["used_inr"], vals["remaining_inr"], vals["days_left"],
+                 vals["valid_until"], vals["answers"], rid))
+            if rid and vals["used_inr"] is not None:
+                con.execute(
+                    "INSERT INTO usage_daily(robot_id, day, recharge_id, used_inr, "
+                    "answers, credit_inr, updated) VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(robot_id, day, recharge_id) DO UPDATE SET "
+                    "used_inr=excluded.used_inr, answers=excluded.answers, "
+                    "credit_inr=excluded.credit_inr, updated=excluded.updated",
+                    (robot_id, ist_day(now), rid, vals["used_inr"], vals["answers"],
+                     vals["credit_inr"], now))
+
+    def pending_for(robot_id):
         grant_free_first_month(robot_id)
         with db() as con:
             rows = con.execute("SELECT payment_id, robot_id, code, credit_inr, days, "
@@ -517,7 +630,7 @@ def create_app(env=None):
             out.append({"recharge_id": r["payment_id"], "code": code,
                         "credit_inr": r["credit_inr"], "days": r["days"],
                         "created": r["created"]})
-        return jsonify(out)
+        return out
 
     def grant_free_first_month(robot_id):
         """Free first month for a listed robot that never had a recharge.
@@ -604,6 +717,8 @@ def create_app(env=None):
         return jsonify(recharge_id=recharge_id, robot_id=row["robot_id"],
                        applied=bool(row["applied"]), applied_at=row["applied_at"])
 
+    import admin                                 # internal dashboard (/admin)
+    admin.register(app, db, registry, WEB_DIR, log, ist_day)
     return app
 
 
