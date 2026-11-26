@@ -113,7 +113,10 @@ RECHARGE_COLS = "payment_id, order_id, robot_id, credit_inr, days, code, created
 
 
 class RobotRegistry:
-    """Factory list of robot ids (optional). Re-read when the file changes."""
+    """Factory list of robot ids (optional). Re-read when the file changes.
+    Matching ignores upper/lower case ("liza001" finds "LIZA001"), and the
+    id is always returned exactly as written in the list, because the robot
+    compares the id in its code with its own id exactly."""
 
     def __init__(self, path):
         self.path = path
@@ -130,14 +133,16 @@ class RobotRegistry:
             for line in f:
                 parts = line.split("#", 1)[0].split(None, 1)
                 if parts and ROBOT_ID_RE.match(parts[0]):
-                    robots[parts[0]] = parts[1].strip() if len(parts) > 1 else None
+                    model = parts[1].strip() if len(parts) > 1 else None
+                    robots[parts[0].upper()] = (parts[0], model)
         self._robots, self._mtime = robots, mtime
         log.info("robot list loaded: %d robots", len(robots))
 
     def lookup(self, robot_id):
-        """-> (known, model). With no list configured every valid id is known."""
+        """-> (robot_id as in the list, model), or (None, None) if unknown.
+        With no list configured every valid id is accepted as given."""
         if not self.path:
-            return True, None
+            return robot_id, None
         with self._lock:
             try:
                 self._load()
@@ -145,10 +150,8 @@ class RobotRegistry:
                 # Keep the last good list; with none at all, refuse (fail closed).
                 log.error("robot list %s unreadable: %s", self.path, type(e).__name__)
                 if self._mtime is None:
-                    return False, None
-            if robot_id in self._robots:
-                return True, self._robots[robot_id]
-            return False, None
+                    return None, None
+            return self._robots.get(robot_id.upper(), (None, None))
 
 
 class RateLimiter:
@@ -383,9 +386,11 @@ def create_app(env=None):
         plan = PLANS.get(plan_id) if isinstance(plan_id, str) else None
         if not ROBOT_ID_RE.match(robot_id) or not plan:
             return jsonify(error="robot_id and a valid plan_id are required"), 400
-        if not registry.lookup(robot_id)[0]:
+        listed = registry.lookup(robot_id)[0]
+        if not listed:
             log.warning("order refused: unknown robot %s from %s", robot_id, client_ip())
             return jsonify(error="unknown robot_id"), 404
+        robot_id = listed                       # exact spelling from the list
         amount = int(round(plan["price_inr"] * 100))
         try:
             r = requests.post(RAZORPAY_ORDERS_URL,
@@ -507,10 +512,10 @@ def create_app(env=None):
         robot_id = _str(request.args.get("robot_id"))
         if not ROBOT_ID_RE.match(robot_id):
             return jsonify(error="robot_id is required"), 400
-        known, model = registry.lookup(robot_id)
-        if not known:
+        listed, model = registry.lookup(robot_id)
+        if not listed:
             return jsonify(error="unknown robot_id"), 404
-        return jsonify(robot_id=robot_id, model=model)
+        return jsonify(robot_id=listed, model=model)
 
     @app.get("/ai-plan/recharge-status")
     def recharge_status():

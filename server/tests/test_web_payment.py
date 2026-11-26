@@ -72,8 +72,35 @@ def test_robot_lookup_with_list(reg_client):
     assert reg_client.get("/ai-plan/robot?robot_id=BARE003").get_json()["model"] is None
     r = reg_client.get("/ai-plan/robot?robot_id=GIYA01")
     assert r.status_code == 404 and r.get_json() == {"error": "unknown robot_id"}
-    assert reg_client.get("/ai-plan/robot?robot_id=giya001").status_code == 404
     assert reg_client.get("/ai-plan/robot?robot_id=not").status_code == 404
+    assert reg_client.get("/ai-plan/robot?robot_id=lieexa001").status_code == 404
+
+
+@pytest.mark.parametrize("typed", ["giya001", "Giya001", "GIYA001", "gIyA001"])
+def test_robot_lookup_ignores_case_and_returns_listed_spelling(reg_client, typed):
+    assert reg_client.get(f"/ai-plan/robot?robot_id={typed}").get_json() == \
+        {"robot_id": "GIYA001", "model": "Giya"}
+
+
+def test_order_with_lowercase_id_is_for_the_listed_robot(reg_client, razorpay):
+    import ai_recharge
+    from conftest import PUBKEY_HEX
+    from test_recharge_api import confirm
+    r = reg_client.post("/ai-plan/order", json={"robot_id": "giya001", "plan_id": "monthly"})
+    assert r.status_code == 200
+    assert r.get_json()["robot_id"] == "GIYA001"
+    assert razorpay.calls[0]["json"]["notes"]["robot_id"] == "GIYA001"
+    code = confirm(reg_client, r.get_json()["order_id"], "pay_CASE1").get_json()["code"]
+    # the signed code names the robot exactly as the robot knows itself
+    assert ai_recharge.read_code(code, PUBKEY_HEX)[1]["robot_id"] == "GIYA001"
+
+
+def test_mixed_case_id_in_list_is_kept_exactly(tmp_path, razorpay):
+    robots = tmp_path / "r.txt"
+    robots.write_text("Lab-Bot_7 Test\n", encoding="utf-8")
+    env = dict(os.environ, AI_PLAN_DB=str(tmp_path / "m.db"), AI_PLAN_ROBOTS=str(robots))
+    c = recharge_api.create_app(env).test_client()
+    assert c.get("/ai-plan/robot?robot_id=LAB-BOT_7").get_json()["robot_id"] == "Lab-Bot_7"
 
 
 def test_order_refused_for_robot_not_on_list(reg_client, razorpay):

@@ -40,13 +40,15 @@
     api("GET", "/ai-plan/robot?robot_id=" + encodeURIComponent(id)).then(function (res) {
       $("robot-check").disabled = false;
       if (res.status === 200) {
-        state.robot = id;
-        msg($("robot-ok"), "✓ Robot " + id + (res.data.model ? " · " + res.data.model : ""));
+        // The server answers with the id exactly as on its factory list.
+        state.robot = res.data.robot_id || id;
+        $("robot-id").value = state.robot;
+        msg($("robot-ok"), "✓ Robot " + state.robot + (res.data.model ? " · " + res.data.model : ""));
         loadPlan();
       } else if (res.status === 404) {
         state.robot = null; show($("plan-card"), false);
         msg($("robot-err"), "We can't find robot “" + id + "”. Check the ID on the label " +
-          "(capital letters and zeros matter).");
+          "letter by letter (0 is zero, O is the letter).");
       } else {
         msg($("robot-err"), niceError(res, "Could not check the robot."));
       }
@@ -163,9 +165,14 @@
   }
 
   // ── wiring ────────────────────────────────────────────────────────────
+  // Robot ids are capitals on the label: "liza001" means LIZA001.
+  function typedId(v) { return (v || "").replace(/\s+/g, "").toUpperCase(); }
+
   $("robot-form").addEventListener("submit", function (e) {
     e.preventDefault();
-    checkRobot($("robot-id").value.trim());
+    var id = typedId($("robot-id").value);
+    $("robot-id").value = id;
+    checkRobot(id);
   });
   $("robot-id").addEventListener("input", function () {
     state.robot = null; show($("plan-card"), false);
@@ -179,7 +186,7 @@
 
   var pre = new URLSearchParams(window.location.search).get("robot");
   if (pre) {
-    $("robot-id").value = pre.trim();
-    checkRobot(pre.trim());
+    $("robot-id").value = typedId(pre);
+    checkRobot(typedId(pre));
   }
 })();
