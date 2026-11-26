@@ -297,8 +297,12 @@ The server currently uses **Razorpay test keys**, so no real money moves.
   click *Success* on the test page) or a card from Razorpay's
   [Test Card Details](https://razorpay.com/docs/payments/payments/test-card-details/)
   (any future expiry, any CVV).
-- Use a test robot id (e.g. `TEST001`) if you don't have a robot; steps 1–4,
-  6 and 7 work without one. A real robot rejects codes for other robots.
+- Only robot ids on the server's factory list can be paid for (others get
+  **404 `unknown robot_id`**). Ask Hutark for an id to test with; steps 1–4,
+  6 and 7 work without the robot itself. A real robot rejects codes for other
+  robots.
+- Robot ids are not case-sensitive on the server: `liza001` is `LIZA001`.
+  The server answers with the id as written on the list – use that one.
 - When the server switches to live keys, `key_id` from `/order` becomes
   `rzp_live_…` automatically – no app change needed.
 
