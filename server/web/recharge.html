@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Hutark AI Recharge</title>
+<link rel="stylesheet" href="/recharge.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">HUTARK</div>
+    <h1>Recharge your robot's AI plan</h1>
+    <p class="sub">ChatGPT answers for your robot, paid monthly. No app needed.</p>
+  </header>
+
+  <div id="testmode" class="banner" hidden>
+    Test mode – no real money moves. Pay with Netbanking → any bank → <b>Success</b>,
+    or UPI <b>success@razorpay</b>.
+  </div>
+
+  <!-- 1. which robot -->
+  <section id="robot-card" class="card">
+    <h2><span class="num">1</span> Your robot</h2>
+    <form id="robot-form" autocomplete="off">
+      <label for="robot-id">Robot ID</label>
+      <div class="row">
+        <input id="robot-id" name="robot" maxlength="64" spellcheck="false"
+               autocapitalize="characters" placeholder="e.g. GIYA001" required>
+        <button type="submit" id="robot-check">Continue</button>
+      </div>
+      <p class="hint">It is on the label on your robot, and in the Hutark app under robot details.</p>
+    </form>
+    <p id="robot-ok" class="ok" hidden></p>
+    <p id="robot-err" class="err" hidden></p>
+  </section>
+
+  <!-- 2. plan + pay -->
+  <section id="plan-card" class="card" hidden>
+    <h2><span class="num">2</span> Plan</h2>
+    <div id="plan" class="plan"></div>
+    <p class="note">The plan starts when your robot receives it and lasts 30 days.
+      If your robot still has credit left, it is added to the new plan.</p>
+    <button id="pay" class="primary">Pay</button>
+    <p id="pay-err" class="err" hidden></p>
+  </section>
+
+  <!-- 3. done -->
+  <section id="done-card" class="card" hidden>
+    <h2><span class="num">3</span> <span id="done-title">Payment received</span></h2>
+    <div id="robot-state" class="state waiting">
+      <span class="dot"></span>
+      <span id="robot-state-text">Waiting for your robot to pick up the recharge…</span>
+    </div>
+    <p id="done-text">Keep your robot switched on and connected to the internet.
+      It recharges itself within a few minutes and says
+      <i>"Thank you. My AI plan is recharged."</i> You can close this page.</p>
+    <p class="ref">Payment reference: <code id="pay-ref"></code><br>
+      Please quote it if you contact Hutark support.</p>
+    <button id="again" class="link">Recharge another robot</button>
+  </section>
+
+  <footer>
+    Payments by Razorpay. Questions? <a href="https://hutark.com" rel="noopener">hutark.com</a>
+  </footer>
+</main>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script src="/recharge.js"></script>
+</body>
+</html>

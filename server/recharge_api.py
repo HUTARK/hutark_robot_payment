@@ -11,7 +11,11 @@ Endpoints (full reference in SERVER_SETUP.md)
   POST /ai-plan/webhook  Razorpay webhook (payment.captured) - issues the code even
                          if the app never calls /confirm
   GET  /ai-plan/pending?robot_id=X   codes issued for X, not yet applied
+                                     (the robot polls this itself)
   POST /ai-plan/applied  {recharge_id}                 -> mark a code as applied
+  GET  /ai-plan/robot?robot_id=X     is X a Hutark robot (+ model), for the pay page
+  GET  /ai-plan/recharge-status?recharge_id=pay_X      applied yet? (pay page)
+  GET  /recharge[?robot=X]           customer payment web page (web/recharge.html)
 
 Safety
   * The price comes from the ORDER stored here, never from the app.
@@ -27,6 +31,10 @@ Safety
 
 Config: environment variables only (see REQUIRED_ENV). Missing ones stop the
 app at startup, so a broken /etc/hutark-ai.env shows up in `journalctl`.
+Optional: AI_PLAN_ROBOTS = path of the factory robot list (one robot_id per
+line, optionally followed by the model, `#` comments). When set, orders are
+accepted only for robots on that list, so a typo on the payment page cannot
+pay for a robot that does not exist. Re-read automatically when it changes.
 
 Local run (test keys):  python recharge_api.py   (listens on 127.0.0.1:8080)
 Production:             gunicorn -w 2 -b 127.0.0.1:8080 recharge_api:app
@@ -44,7 +52,7 @@ from collections import deque
 from contextlib import contextmanager
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, redirect, request, send_from_directory
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -76,6 +84,15 @@ RZP_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")     # order_XXXX / pay_XXXX
 
 log = logging.getLogger("hutark-ai")
 
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+# Razorpay Checkout runs its own script and iframe; nothing else may.
+WEB_CSP = ("default-src 'self'; script-src 'self' https://checkout.razorpay.com; "
+           "frame-src https://api.razorpay.com https://checkout.razorpay.com; "
+           "connect-src 'self' https://*.razorpay.com; "
+           "img-src 'self' data: https://*.razorpay.com; "
+           "style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; "
+           "form-action https://api.razorpay.com; frame-ancestors 'none'")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders(
     order_id TEXT PRIMARY KEY, robot_id TEXT NOT NULL, plan_id TEXT NOT NULL,
@@ -93,6 +110,45 @@ MIGRATIONS = {
                   ("applied_at", "REAL"), ("source", "TEXT")],
 }
 RECHARGE_COLS = "payment_id, order_id, robot_id, credit_inr, days, code, created"
+
+
+class RobotRegistry:
+    """Factory list of robot ids (optional). Re-read when the file changes."""
+
+    def __init__(self, path):
+        self.path = path
+        self._mtime = None
+        self._robots = {}
+        self._lock = threading.Lock()
+
+    def _load(self):
+        mtime = os.stat(self.path).st_mtime_ns
+        if mtime == self._mtime:
+            return
+        robots = {}
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split("#", 1)[0].split(None, 1)
+                if parts and ROBOT_ID_RE.match(parts[0]):
+                    robots[parts[0]] = parts[1].strip() if len(parts) > 1 else None
+        self._robots, self._mtime = robots, mtime
+        log.info("robot list loaded: %d robots", len(robots))
+
+    def lookup(self, robot_id):
+        """-> (known, model). With no list configured every valid id is known."""
+        if not self.path:
+            return True, None
+        with self._lock:
+            try:
+                self._load()
+            except OSError as e:
+                # Keep the last good list; with none at all, refuse (fail closed).
+                log.error("robot list %s unreadable: %s", self.path, type(e).__name__)
+                if self._mtime is None:
+                    return False, None
+            if robot_id in self._robots:
+                return True, self._robots[robot_id]
+            return False, None
 
 
 class RateLimiter:
@@ -157,6 +213,7 @@ def create_app(env=None):
     # which appends the real client IP to X-Forwarded-For.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
     limiters = {name: RateLimiter(*lim) for name, lim in RATE_LIMITS.items()}
+    registry = RobotRegistry(env.get("AI_PLAN_ROBOTS") or None)
     db_path = cfg["AI_PLAN_DB"]
 
     if not log.handlers and not logging.getLogger().handlers:
@@ -280,6 +337,30 @@ def create_app(env=None):
         log.exception("unhandled error on %s %s", request.method, request.path)
         return jsonify(error="internal error"), 500
 
+    # ── payment web page ──────────────────────────────────────────────────
+    def web_file(name, mimetype):
+        resp = send_from_directory(WEB_DIR, name, mimetype=mimetype, max_age=300)
+        resp.headers["Content-Security-Policy"] = WEB_CSP
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["Referrer-Policy"] = "no-referrer"      # robot id is in the URL
+        return resp
+
+    @app.get("/")
+    def root():
+        return redirect("/recharge", code=302)
+
+    @app.get("/recharge")
+    def recharge_page():
+        return web_file("recharge.html", "text/html")
+
+    @app.get("/recharge.js")
+    def recharge_js():
+        return web_file("recharge.js", "text/javascript")
+
+    @app.get("/recharge.css")
+    def recharge_css():
+        return web_file("recharge.css", "text/css")
+
     # ── endpoints ─────────────────────────────────────────────────────────
     @app.get("/health")
     def health():
@@ -302,6 +383,9 @@ def create_app(env=None):
         plan = PLANS.get(plan_id) if isinstance(plan_id, str) else None
         if not ROBOT_ID_RE.match(robot_id) or not plan:
             return jsonify(error="robot_id and a valid plan_id are required"), 400
+        if not registry.lookup(robot_id)[0]:
+            log.warning("order refused: unknown robot %s from %s", robot_id, client_ip())
+            return jsonify(error="unknown robot_id"), 404
         amount = int(round(plan["price_inr"] * 100))
         try:
             r = requests.post(RAZORPAY_ORDERS_URL,
@@ -414,6 +498,37 @@ def create_app(env=None):
         if cur.rowcount == 0:
             return jsonify(error="unknown recharge_id"), 404
         return jsonify(ok=True, recharge_id=recharge_id, applied=True)
+
+    @app.get("/ai-plan/robot")
+    def robot_info():
+        limited = rate_limited("lookup")
+        if limited:
+            return limited
+        robot_id = _str(request.args.get("robot_id"))
+        if not ROBOT_ID_RE.match(robot_id):
+            return jsonify(error="robot_id is required"), 400
+        known, model = registry.lookup(robot_id)
+        if not known:
+            return jsonify(error="unknown robot_id"), 404
+        return jsonify(robot_id=robot_id, model=model)
+
+    @app.get("/ai-plan/recharge-status")
+    def recharge_status():
+        # Never returns the code itself: a status page has no need for the
+        # voucher, so a leaked payment id cannot leak it either.
+        limited = rate_limited("lookup")
+        if limited:
+            return limited
+        recharge_id = _str(request.args.get("recharge_id"))
+        if not RZP_ID_RE.match(recharge_id):
+            return jsonify(error="recharge_id is required"), 400
+        with db() as con:
+            row = con.execute("SELECT robot_id, applied, applied_at FROM recharges "
+                              "WHERE payment_id=?", (recharge_id,)).fetchone()
+        if not row:
+            return jsonify(error="unknown recharge_id"), 404
+        return jsonify(recharge_id=recharge_id, robot_id=row["robot_id"],
+                       applied=bool(row["applied"]), applied_at=row["applied_at"])
 
     return app
 

@@ -41,9 +41,26 @@ integration guide: `../README.md`):
    then `POST /ai-plan/applied {recharge_id}`. `GET /ai-plan/pending?robot_id=X`
    lists codes that were issued but not yet applied.
 
+Customers can also pay without the app on the payment page
+`https://<server>/recharge?robot=<robot_id>` (files in `web/`). Robots fetch
+their own codes from `/ai-plan/pending` and report `/ai-plan/applied`, and the
+page polls `/ai-plan/recharge-status` to show "robot recharged".
+
 Config comes only from environment variables: `RAZORPAY_KEY_ID`,
 `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`, `HUTARK_AI_PRIVATE_KEY`,
 `AI_PLAN_DB`.
+
+Optional `AI_PLAN_ROBOTS`: path of the factory robot list. Orders are then
+accepted only for robots on it, so a typo on the payment page cannot pay for
+a robot that doesn't exist. One robot per line, optionally followed by the
+model shown on the page; `#` starts a comment. Changes are picked up
+without a restart. If the file is missing, no orders are accepted.
+
+```
+# robots.txt
+GIYA001  Giya
+LISA002  Lisa
+```
 
 Tests (Razorpay mocked, no network):
 

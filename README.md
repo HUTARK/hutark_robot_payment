@@ -4,13 +4,23 @@ Customers pay monthly (Razorpay) for their robot's ChatGPT usage. This repo
 contains the **payment server** and this **integration guide for the Hutark
 app**.
 
+- The customer pays on Hutark's **payment page**
+  `https://api.hutark.com/recharge?robot=<robot_id>` (any phone or computer,
+  anywhere, no app needed) **or in the Hutark app**.
 - The server takes the Razorpay payment, verifies it, and issues a **recharge
   code** (`HTK1.…`) signed with Hutark's private key.
-- The app hands that code to the robot on the local network. The robot checks
-  the signature with Hutark's public key and turns on ChatGPT for the plan.
+- **The robot fetches its own code** from the server (every minute while it
+  has no plan, every 5 minutes otherwise), checks the signature with Hutark's
+  public key and turns on ChatGPT. The app may also hand the code over
+  directly on the local network – that is just faster, not required.
 
 Production base URL: **`https://api.hutark.com`**
 (currently running with Razorpay **test** keys)
+
+> **Simplest app integration:** open
+> `https://api.hutark.com/recharge?robot=<robot_id>` in the browser / a
+> WebView and you are done. Sections 2–7 are only needed if the app wants
+> its own native checkout.
 
 ---
 
@@ -47,19 +57,27 @@ sequenceDiagram
     RZP-->>API: webhook payment.captured (backup path)
     App->>API: POST /ai-plan/confirm {3 razorpay fields}
     API-->>App: {code, recharge_id, credit_inr, days}
-    App->>Robot: POST /ai_plan/recharge {code}
+    App->>Robot: POST /ai_plan/recharge {code}  (optional, faster)
     Robot-->>App: 200 recharged
     App->>API: POST /ai-plan/applied {recharge_id}
+    Robot->>API: GET /ai-plan/pending?robot_id=… (robot, every 1–5 min)
+    Robot->>API: POST /ai-plan/applied {recharge_id}
 ```
+
+The payment page (`/recharge`) runs the same order → Checkout → confirm
+steps in the browser and then shows "robot recharged" once the robot has
+fetched and applied the code.
 
 Important properties:
 
 - **One payment = one code.** `/confirm` can be retried safely – it always
   returns the same code for the same payment.
-- **Nothing is lost if the app dies after paying.** Razorpay's webhook also
-  makes the server issue the code; the app picks it up later from
-  `GET /ai-plan/pending?robot_id=…`.
+- **Nothing is lost if the app or browser dies after paying.** Razorpay's
+  webhook also makes the server issue the code, and the robot fetches it by
+  itself.
 - **A code works on one robot only, once.** It cannot be used on another robot.
+- **Two payments both count.** If the robot still has credit when a new code
+  arrives, the unused credit is added to the new 30-day plan.
 - **The price is decided by the server**, never by the app.
 
 ---
@@ -78,8 +96,8 @@ Call the robot (same Wi-Fi) `GET http://<robot-ip>:5000/ai_plan`. Use its
 Show `price_inr` (what the customer pays) and that the robot gets
 `credit_inr` of ChatGPT usage for `days` days.
 
-> If the robot's plan is still **active**, warn the user: a new recharge
-> **starts a fresh 30-day plan and the unused credit of the old one is lost**.
+> A new recharge starts a fresh 30-day plan; credit left on the current plan
+> is added to it, so recharging early loses nothing.
 
 ### Step 2 – create the order
 ```http
@@ -135,8 +153,12 @@ Content-Type: application/json
 200 → recharged (the robot also says "Thank you. My AI plan is recharged.").
 400 → see `message` in [section 5](#5-error-handling-cheat-sheet).
 
-The phone must be on the **same network as the robot**. If the robot is not
-reachable now, keep the code and try again later (step 7).
+This step is optional: the robot also fetches the code from the server by
+itself within a few minutes (when it is on and online). Do it when the phone
+is on the **same network as the robot** – the recharge is then instant. If the
+robot is not reachable, just tell the user "your robot will recharge itself
+shortly". You can poll `GET /ai-plan/recharge-status?recharge_id=…` to show
+when it happened.
 
 ### Step 6 – tell the server it was applied
 ```http
@@ -148,7 +170,8 @@ Content-Type: application/json
 Also do this when the robot answers `code_already_used` (it was applied
 before). Calling it twice is fine.
 
-### Step 7 – recover unapplied codes (on app start / when a robot connects)
+### Step 7 – (optional) recover unapplied codes on app start / robot connect
+The robot does this by itself; do it in the app only for an instant recharge.
 ```http
 GET https://api.hutark.com/ai-plan/pending?robot_id=GIYA001
 ```
@@ -178,7 +201,14 @@ Base URL `https://api.hutark.com`. JSON in and out. Errors are always
 | `POST /ai-plan/confirm` | `{razorpay_order_id, razorpay_payment_id, razorpay_signature}` | `{code, recharge_id, robot_id, credit_inr, days}` | 400 not verified / unknown order, 409 order already paid by another payment, 429 |
 | `GET /ai-plan/pending` | `?robot_id=X` | `[{recharge_id, code, credit_inr, days, created}]` | 400 missing robot_id, 429 |
 | `POST /ai-plan/applied` | `{recharge_id}` | `{ok: true, recharge_id, applied: true}` | 400 missing, 404 unknown recharge_id, 429 |
+| `GET /ai-plan/robot` | `?robot_id=X` | `{robot_id, model}` (model may be null) | 400, 404 not a Hutark robot, 429 |
+| `GET /ai-plan/recharge-status` | `?recharge_id=pay_X` | `{recharge_id, robot_id, applied, applied_at}` (never the code) | 400, 404, 429 |
+| `GET /recharge` | `?robot=X` (optional) | customer payment web page | – |
 | `POST /ai-plan/webhook` | Razorpay only (signed) | – | not for the app |
+
+When the server has a factory robot list (see
+[`server/README_SERVER.md`](server/README_SERVER.md)), `/order` answers
+**404 `unknown robot_id`** for robots that are not on it.
 
 - `robot_id`: 1–64 characters `A-Z a-z 0-9 _ -`.
 - `created`: Unix time (seconds, UTC).
@@ -206,6 +236,12 @@ suggest a recharge.
 ### `POST /ai_plan/recharge {"code": "HTK1...."}`
 200 with the new plan status (as above) and `"status": "ok"`, or 400 with
 `"status": "error"` and a `message` (see below).
+
+### `POST /ai_plan/sync`
+Makes the robot check the server for paid recharges **now** instead of at
+its next background check. `200 {"ok": true, "applied": n, "pending": n,
+"plan": {…}}`, or `502 {"ok": false, "error": "…"}` when the robot cannot
+reach the server.
 
 ### `GET /status`
 The robot's general status also contains `ai_plan_active`, `ai_plan_reason`,
@@ -248,8 +284,8 @@ Server:
   `/plans`.
 - Don't hard-code `key_id` – it switches from test to live on the server.
 - Treat codes like vouchers: don't log them or send them to analytics.
-- Always finish with `/applied`, and always run the `/pending` recovery on
-  app start / robot connect.
+- If the app delivers codes itself, finish with `/applied`. The `/pending`
+  recovery is optional – the robot fetches unapplied codes by itself.
 
 ---
 
@@ -274,6 +310,7 @@ The server currently uses **Razorpay test keys**, so no real money moves.
 server/
   recharge_api.py     Flask API (all endpoints above)
   ai_recharge.py      key generation + signing/checking of HTK1 codes
+  web/                customer payment page (/recharge): html, js, css
   requirements.txt
   tests/              pytest suite (Razorpay mocked, no network)
   README_SERVER.md    server notes (pricing, manual codes)
